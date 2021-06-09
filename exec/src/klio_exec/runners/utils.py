@@ -33,12 +33,12 @@ from klio_core.proto import klio_pb2
 
 _LOGGER = logging.getLogger("klio")
 
-LOCK = threading.Lock()
 ENTITY_ID_TO_ACK_ID = {}
 
 
 
 class PubSubKlioMessage:
+
     def __init__(self, ack_id, kmsg_id):
         self.ack_id = ack_id
         self.kmsg_id = kmsg_id
@@ -46,44 +46,77 @@ class PubSubKlioMessage:
         self.last_extended_for = None
         self.event = threading.Event()
 
-    def __repr__(self):
-        return f"PubSubKlioMessage(kmsg_id={self.kmsg_id})"
-
     def extend(self, duration):
         self.last_extended = time.monotonic()
         self.last_extended_for = duration
+
+    def __repr__(self):
+        return f"PubSubKlioMessage(kmsg_id={self.kmsg_id})"
 
 
 class MessageManager:
     DEFAULT_DEADLINE_EXTENSION = 10
     # DEFAULT_DEADLINE_EXTENSION = 60 * 5  # 5 minutes
 
-    # TODO: increase manager sleep
+    # TODO: increase manager & heartbeat sleep when ready
 
-    def __init__(self, sub_name, heartbeat_sleep=10, manager_sleep=0.1):
+    def __init__(self, sub_name, heartbeat_sleep=1, manager_sleep=0.1):
         # can't re-use client since the other class closes the channel
         self._client = g_pubsub.SubscriberClient()
         self._sub_name = sub_name
         self.heartbeat_sleep = heartbeat_sleep
         self.manager_sleep = manager_sleep
         self.messages = []
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        self.messages_lock = threading.Lock()
+        self.logger = logging.getLogger("klio.message_manager")
+        self.start_threads()
 
-    def manage(self, message):
-        diff = 0
-        while not message.event.is_set():
-            now = time.monotonic()
-            if message.last_extended is not None:
-                diff = now - message.last_extended
-            if message.last_extended is None or diff >= (self.DEFAULT_DEADLINE_EXTENSION - 60):
-                self.extend_deadline(message)
-            else:
-                _LOGGER.warning(f"Skipping extending deadline {message}")
+    def start_threads(self):
+        mgr_thread = threading.Thread(
+            target=self.manage, 
+            args=(self.manager_sleep,), 
+            name="KlioMessageManager",
+            daemon=True,
+        )
+        mgr_thread.start()
 
-            time.sleep(self.manager_sleep)
-        else:
-            _LOGGER.warning(f"No longer extending deadline for {message}")
-            self.remove(message)
+        heartbeat_thread = threading.Thread(
+            target=self.heartbeat, 
+            args=(self.heartbeat_sleep,), 
+            name="KlioMessageHeartbeat",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+
+    def manage(self, to_sleep):
+        while True:
+            to_remove = []
+            with self.messages_lock:
+                for message in self.messages:
+                    diff = 0
+                    if not message.event.is_set():
+                        now = time.monotonic()
+                        if message.last_extended is not None:
+                            diff = now - message.last_extended
+                        if message.last_extended is None or diff >= (self.DEFAULT_DEADLINE_EXTENSION - 8):
+                            self.extend_deadline(message)
+                        else:
+                            self.logger.warning(f"Skipping extending deadline {message}")
+                    else:
+                        self.logger.warning(f"XX message manager going to remove {message}")
+                        to_remove.append(message)
+
+            for message in to_remove:
+                self.logger.warning(f"Is event set for {message.kmsg_id}? {message.event.is_set()}")
+                self.remove(message)
+            
+            time.sleep(to_sleep)
+            
+    def heartbeat(self, to_sleep):
+        while True:
+            for message in self.messages:
+                self.logger.warning(f"Still processing {message.kmsg_id}...")
+            time.sleep(to_sleep)
         
     def extend_deadline(self, message, duration=None):
         if duration is None:
@@ -94,26 +127,29 @@ class MessageManager:
             "ack_deadline_seconds": duration,  # seconds
         }
         # TODO: this method also has `retry` and `timeout` kwargs which
-        # we may be interested
+        # we may be interested in using
         self._client.modify_ack_deadline(**request)
         message.extend(duration)
-        _LOGGER.warning(f"Extended deadline for {message} by {duration}")
+        self.logger.warning(f"Extended deadline for {message} by {duration}")
 
     def add(self, message):
-        _LOGGER.warning(f"Received {message.kmsg_id}")
-        _LOGGER.warning(f"Message event status for {message.kmsg_id}: {message.event.is_set()}")
+        self.logger.warning(f"Received {message.kmsg_id}")
+        self.logger.warning(f"Message event status for {message.kmsg_id}: {message.event.is_set()}")
         self.extend_deadline(message)
         ENTITY_ID_TO_ACK_ID[message.kmsg_id] = message
-        self.executor.submit(self.manage, message)
+        with self.messages_lock:
+            self.messages.append(message)
 
     def remove(self, message):
         # TODO: this method also has `retry`, `timeout` and metadata 
-        # kwargs which we may be interested
+        # kwargs which we may be interested in using
         self._client.acknowledge(self._sub_name, [message.ack_id])
-        _LOGGER.warning(f"Acknowledged {message.kmsg_id}.")
-        with LOCK:
-            ENTITY_ID_TO_ACK_ID.pop(message.kmsg_id)
-        _LOGGER.warning(f"Done processing {message.kmsg_id}.")
+        self.logger.warning(f"Acknowledged {message.kmsg_id}.")
+        index = self.messages.index(message)
+        with self.messages_lock:
+            self.messages.pop(index)
+        ENTITY_ID_TO_ACK_ID.pop(message.kmsg_id)
+        self.logger.warning(f"Done processing {message.kmsg_id}.")
 
 
 class KlioPubSubReadEvaluator(transform_evaluator._PubSubReadEvaluator):
@@ -171,76 +207,41 @@ class KlioTransformEvaluatorRegistry(transform_evaluator.TransformEvaluatorRegis
         self._evaluators[direct_runner._DirectReadFromPubSub] = KlioPubSubReadEvaluator
 
 
-class _KlioDirectWriteToPubSubFn(beam.DoFn):
-    BUFFER_SIZE_ELEMENTS = 1
-    FLUSH_TIMEOUT_SECS = BUFFER_SIZE_ELEMENTS * 0.01
+class KlioAck(beam.DoFn):
+    def __init__(self):
+        self.logger = logging.getLogger("klio.message_manager")
 
-    def __init__(self, transform):
-        self.project = transform.project
-        self.short_topic_name = transform.topic_name
-        self.id_label = transform.id_label
-        self.timestamp_attribute = transform.timestamp_attribute
-        self.with_attributes = transform.with_attributes
+    def process(self, element):
+        self.logger.warning("IN KLIO ACK OVERRIDE!")
 
-        # TODO(BEAM-4275): Add support for id_label and timestamp_attribute.
-        if transform.id_label:
-            raise NotImplementedError(
-                'DirectRunner: id_label is not supported for '
-                'PubSub writes')
-        if transform.timestamp_attribute:
-            raise NotImplementedError(
-                'DirectRunner: timestamp_attribute is not '
-                'supported for PubSub writes')
-
-    def setup(self):
-        self.pub_client = g_pubsub.PublisherClient()
-        self.topic = self.pub_client.topic_path(self.project, self.short_topic_name)
-
-    def start_bundle(self):
-        self._buffer = []
-
-    def process(self, elem):
-        self._buffer.append(elem)
- 
-        # TODO: either use handle_klio, or 
-        # figure out how to handle when a parsed_message can't be parsed
-        # into a KlioMessage
         kmsg = klio_pb2.KlioMessage()
-        kmsg.ParseFromString(elem)
+        kmsg.ParseFromString(element)
         entity_id = kmsg.data.element.decode("utf-8")
-        with LOCK:
-            msg = ENTITY_ID_TO_ACK_ID.get(entity_id)
-            _LOGGER.warning(f"XXX GOT ack_id {id(msg)} for {entity_id}!")
-            _LOGGER.warning(f"XXX dir(msg) {dir(msg)} for {entity_id}!")
-            msg.event.set()
+        # with LOCK:
+        msg = ENTITY_ID_TO_ACK_ID.get(entity_id)
+        self.logger.warning(f"XXX GOT ack_id {msg} for {entity_id}!")
+        msg.event.set()
 
-        future = self.pub_client.publish(self.topic, elem)
-        future.result()
-        # if len(self._buffer) >= self.BUFFER_SIZE_ELEMENTS:
-        #     self._flush()
+        yield element
 
-    def finish_bundle(self):
-        self._flush()
 
+# this class isn't needed; it's just to know that the composite override is working
+class _KlioDirectWriteToPubSubFn(direct_runner._DirectWriteToPubSubFn):
     def _flush(self):
-        _LOGGER.warning("**** KLIO FLUSHINGGGG")
-        # from google.cloud import pubsub
-        # pub_client = pubsub.PublisherClient()
-        # topic = pub_client.topic_path(self.project, self.short_topic_name)
+        _LOGGER.warning(f"FLUSHINGGG")
+        return super(_KlioDirectWriteToPubSubFn, self)._flush()
 
-        if self.with_attributes:
-            futures = [
-                self.pub_client.publish(self.topic, elem.data, **elem.attributes)
-                for elem in self._buffer
-            ]
-        else:
-            futures = [self.pub_client.publish(self.topic, elem) for elem in self._buffer]
 
-        timer_start = time.time()
-        for future in futures:
-            remaining = self.FLUSH_TIMEOUT_SECS - (time.time() - timer_start)
-            future.result(remaining)
-        self._buffer = []
+class _KlioAckAndWrite(beam.PTransform):
+    def __init__(self, override):
+        self.override = override
+
+    def expand(self, pcoll):
+        return (
+            pcoll
+            | beam.ParDo(KlioAck())
+            | beam.ParDo(_KlioDirectWriteToPubSubFn(self.override))
+        )
 
 
 class KlioWriteToPubSubOverride(pipeline.PTransformOverride):
@@ -248,4 +249,5 @@ class KlioWriteToPubSubOverride(pipeline.PTransformOverride):
         return isinstance(applied_ptransform.transform, beam_pubsub.WriteToPubSub)
 
     def get_replacement_transform_for_applied_ptransform(self, applied_ptransform):
-        return beam.ParDo(_KlioDirectWriteToPubSubFn(applied_ptransform.transform))
+        return _KlioAckAndWrite(applied_ptransform.transform)
+
