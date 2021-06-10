@@ -29,6 +29,7 @@ from klio_core import __version__ as klio_core_version
 from klio_core.config import core as config_core
 
 from klio_exec import __version__ as klio_exec_version
+from klio_exec.runners import pubsub_message_manager
 
 
 DATAFLOW_LABEL_KEY_TO_OS_ENVIRON = {
@@ -404,6 +405,12 @@ class KlioPipeline(object):
                 | lbl("Input Exists Filter")
                 >> helpers.KlioGcsCheckInputExists()
             )
+
+            ack_inp_lbl = lbl("Ack Input Message")
+            _ = (
+                input_exists.not_found 
+                | ack_inp_lbl >> beam.ParDo(pubsub_message_manager.KlioAckInputMessage())
+            )
             _ = (
                 input_exists.not_found
                 | lbl("Drop Not Found Data") >> helpers.KlioDrop()
@@ -449,6 +456,10 @@ class KlioPipeline(object):
         flatten_ign_lbl = lbl("Flatten to Drop Messages to Ignore")
         to_drop_flatten = (v1_to_process.drop, v2_to_process.drop)
         to_drop = to_drop_flatten | flatten_ign_lbl >> beam.Flatten()
+
+        ack_inp_lbl = lbl("Ack Input Message")
+        _ = to_drop | ack_inp_lbl >> beam.ParDo(pubsub_message_manager.KlioAckInputMessage())
+
         ignore_lbl = lbl("Drop Messages to Ignore")
         _ = to_drop | ignore_lbl >> helpers.KlioDrop()
 
@@ -531,6 +542,12 @@ class KlioPipeline(object):
 
         out_pcol = run_callable(to_process, self.config)
 
+        to_ack_input = (
+            (out_pcol, to_pass_thru) 
+            | "Flatten to Ack Input Messages" >> beam.Flatten()
+        )
+        _ = to_ack_input | "Ack Input Messages" >> beam.ParDo(pubsub_message_manager.KlioAckInputMessage())
+
         if self._has_event_outputs:
             output_config = self.config.job_config.events.outputs[0]
             if not output_config.skip_klio_write:
@@ -575,6 +592,13 @@ class KlioPipeline(object):
             logging.error("Error running pipeline: %s" % e)
             raise SystemExit(1)
 
-        if self.runtime_conf.direct_runner or self.runtime_conf.blocking:
+        standard_opts = options.view_as(pipeline_options.StandardOptions)
+        is_gke_direct_runner = standard_opts.runner == "klio_exec.runners.gke_direct.GkeDirectRunner"
+        should_block = (
+           self.runtime_conf.direct_runner, 
+           self.runtime_conf.blocking,
+           is_gke_direct_runner,
+        )
+        if any(should_block):
             # the pipeline on direct runner will otherwise get garbage collected
             result.wait_until_finish()
