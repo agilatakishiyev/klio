@@ -13,11 +13,13 @@
 # limitations under the License.
 #
 
+import glob
 import logging
 import os
 import re
 
 import glom
+import ruamel.yaml
 import yaml
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
@@ -75,11 +77,16 @@ class GKECommandMixin(object):
     @property
     def deployment_config(self):
         if not self._deployment_config:
-            path_to_deployment_config = os.path.join(
-                self.job_dir, "kubernetes", "deployment.yaml"
-            )
-            with open(path_to_deployment_config) as f:
-                self._deployment_config = yaml.safe_load(f)
+            all_yaml = glob.glob(os.path.join(
+                self.job_dir, "kubernetes", "*.yaml"
+            ))
+            for f in all_yaml:
+                path_to_deployment_config = os.path.join(
+                    self.job_dir, "kubernetes", f
+                )
+                with open(path_to_deployment_config) as f:
+                    data =
+            self._deployment_config = yaml.safe_load(f)
         return self._deployment_config
 
     def _deployment_exists(self):
