@@ -227,17 +227,21 @@ def deployment_resp(deployment_config):
 
 
 @pytest.fixture
-def deployment_response_list(deployment_config, deployment_resp):
-    resp = k8s_client.models.v1_deployment_list.V1DeploymentList(
-        items=[deployment_resp]
-    )
-    return resp
+def mock_api_instance(mocker, deployment_config, deployment_resp):
+    mock_api_instance = mocker.Mock()
+    mock_instance_response = mocker.Mock()
+    mock_instance_response.items = [deployment_resp]
+    mock_api_instance.get.return_value = mock_instance_response
+    mock_api_instance.create.return_value = mock_instance_response
+    mock_api_instance.patch.return_value = mock_instance_response
+    mock_api_instance.delete.return_value = mock_instance_response
+    return mock_api_instance
 
 
 @pytest.fixture
-def deployment_response_list_not_exist():
-    resp = k8s_client.models.v1_deployment_list.V1DeploymentList(items=[])
-    return resp
+def dynamic_client(mocker, mock_api_instance):
+    mock_client = mocker.Mock()
+    return mock_client
 
 
 @pytest.fixture
@@ -252,72 +256,61 @@ def active_context():
     }
 
 
-def test_update_deployment(
-    deployment_config,
+def test_update_resource(
     run_pipeline_gke,
-    deployment_resp,
+    dynamic_client,
+    mock_api_instance,
+    deployment_config,
     active_context,
     monkeypatch,
     mocker,
 ):
     deployment_name = glom.glom(deployment_config, "metadata.name")
     namespace = glom.glom(deployment_config, "metadata.namespace")
-    mock_k8s_client = mocker.Mock()
-    mock_k8s_client.patch_namespaced_deployment.return_value = deployment_resp
+    dynamic_client.resources.get.return_value = mock_api_instance
 
-    monkeypatch.setattr(
-        run_pipeline_gke, "_kubernetes_client", mock_k8s_client
-    )
     monkeypatch.setattr(
         run_pipeline_gke, "_kubernetes_active_context", active_context
     )
-    monkeypatch.setattr(
-        run_pipeline_gke, "_deployment_config", deployment_config
-    )
+    monkeypatch.setattr(run_pipeline_gke, "_dynamic_client", dynamic_client)
 
-    run_pipeline_gke._update_deployment()
-    mock_k8s_client.patch_namespaced_deployment.assert_called_once_with(
+    run_pipeline_gke._update_resource(deployment_config)
+    mock_api_instance.patch.assert_called_once_with(
         name=deployment_name, namespace=namespace, body=deployment_config,
     )
 
 
 # Tests for internal functions
 @pytest.mark.parametrize(
-    "deployed,is_exists",
-    (
-        (["deployment-1", "gke-baseline-random-music"], True),
-        (["deployment-2"], False),
-    ),
+    "is_exists", (True, False),
 )
-def test_deployment_exists(
+def test_resource_exists(
     deployment_resp,
     deployment_config,
+    mock_api_instance,
+    dynamic_client,
     active_context,
     run_pipeline_gke,
-    deployment_response_list,
     monkeypatch,
     mocker,
-    deployed,
     is_exists,
 ):
-    mock_k8s_client = mocker.Mock()
-    mock_k8s_client.patch_namespaced_deployment.return_value = deployment_resp
-    mock_k8s_client.list_namespaced_deployment.return_value = (
-        deployment_response_list
-    )
-    monkeypatch.setattr(
-        run_pipeline_gke, "_kubernetes_client", mock_k8s_client
-    )
+    if not is_exists:
+        mock_instance_response = mocker.Mock()
+        mock_instance_response.items = []
+        mock_api_instance.get.return_value = mock_instance_response
+
+    dynamic_client.resources.get.return_value = mock_api_instance
     monkeypatch.setattr(
         run_pipeline_gke, "_kubernetes_active_context", active_context
     )
-    monkeypatch.setattr(
-        run_pipeline_gke, "_deployment_config", deployment_config
+    monkeypatch.setattr(run_pipeline_gke, "_dynamic_client", dynamic_client)
+    existence = run_pipeline_gke._resource_exists(deployment_config)
+    mock_api_instance.get.assert_called_once_with(
+        body=deployment_config,
+        namespace=glom.glom(deployment_config, "metadata.namespace"),
     )
-    run_pipeline_gke._deployment_exists()
-    mock_k8s_client.list_namespaced_deployment.assert_called_once_with(
-        namespace=glom.glom(deployment_config, "metadata.namespace")
-    )
+    assert existence == is_exists
 
 
 @pytest.mark.parametrize(
@@ -419,14 +412,18 @@ def test_validate_labels_raises(label_dict):
     "is_ci,exp_deployed_by", (("true", "ci"), ("false", "stub-user"))
 )
 def test_apply_labels_to_deployment_config(
-    input_config, is_ci, exp_deployed_by, run_pipeline_gke, monkeypatch
+    input_config,
+    is_ci,
+    exp_deployed_by,
+    run_pipeline_gke,
+    monkeypatch,
+    deployment_config,
 ):
     monkeypatch.setitem(job_gke.os.environ, "USER", "stub-user")
     monkeypatch.setitem(job_gke.os.environ, "CI", is_ci)
     monkeypatch.setattr(job_gke, "klio_cli_version", "stub-version")
 
     # TODO: patch user config for user labels
-    monkeypatch.setattr(run_pipeline_gke, "_deployment_config", input_config)
     user_labels = [
         "label_a=value_a",
         "label-b=value-b",
@@ -436,74 +433,40 @@ def test_apply_labels_to_deployment_config(
     monkeypatch.setattr(
         run_pipeline_gke.klio_config.pipeline_options, "labels", user_labels
     )
-
-    expected_config = {
-        "metadata": {"name": "test-job", "labels": {"app": "test-job"}},
-        "spec": {
-            "template": {
-                "metadata": {
-                    "labels": {
-                        "app": "test-job",
-                        "role": "testjob",
-                        "klio/deployed_by": exp_deployed_by,
-                        "klio/klio_cli_version": "stub-version",
-                        "label_a": "value_a",
-                        "label-b": "value-b",
-                        "label-c": "",
-                    }
-                },
-            },
-            "selector": {
-                "matchLabels": {"app": "test-job", "role": "testjob"}
-            },
-        },
+    labels = {
+        "app": "test-job",
+        "role": "testjob",
+        "klio/deployed_by": exp_deployed_by,
+        "klio/klio_cli_version": "stub-version",
+        "label_a": "value_a",
+        "label-b": "value-b",
+        "label-c": "",
     }
+    expected_config = deployment_config.copy()
+    glom.assign(expected_config, "spec.template.metadata.labels", labels)
 
-    run_pipeline_gke._apply_labels_to_deployment_config()
-    assert expected_config == run_pipeline_gke.deployment_config
+    run_pipeline_gke._apply_labels_to_deployment_config(deployment_config)
+    assert expected_config == deployment_config
 
 
 def test_apply_labels_to_deployment_config_overrides(
-    run_pipeline_gke, monkeypatch
+    run_pipeline_gke, monkeypatch, deployment_config
 ):
     monkeypatch.setitem(job_gke.os.environ, "USER", "stub-user")
     monkeypatch.setattr(job_gke, "klio_cli_version", "stub-version")
 
-    input_config = {
-        "metadata": {
-            "name": "test-job",
-            "labels": {"app": "different-app-name"},
-        }
-    }
-    monkeypatch.setattr(run_pipeline_gke, "_deployment_config", input_config)
-
-    expected_config = {
-        "metadata": {
-            "name": "test-job",
-            "labels": {"app": "different-app-name"},
-        },
-        "spec": {
-            "template": {
-                "metadata": {
-                    "labels": {
-                        "app": "different-app-name",
-                        "role": "differentappname",
-                        "klio/deployed_by": "stub-user",
-                        "klio/klio_cli_version": "stub-version",
-                    }
-                },
-            },
-            "selector": {
-                "matchLabels": {
-                    "app": "different-app-name",
-                    "role": "differentappname",
-                }
-            },
-        },
+    labels = {
+        "app": "different-app-name",
+        "role": "differentappname",
+        "klio/deployed_by": "stub-user",
+        "klio/klio_cli_version": "stub-version",
     }
 
-    run_pipeline_gke._apply_labels_to_deployment_config()
-    assert expected_config == run_pipeline_gke.deployment_config
+    expected_config = deployment_config.copy()
+    glom.assign(expected_config, "spec.template.metadata.labels", labels)
+
+    run_pipeline_gke._apply_labels_to_deployment_config(deployment_config)
+    assert expected_config == deployment_config
 
 
 # Tests for user facing functions
@@ -516,17 +479,16 @@ def test_apply_labels_to_deployment_config_overrides(
         (False, True, True),
     ),
 )
-def test_apply_deployment(
+def test_create_resource(
     monkeypatch,
     mocker,
     run_pipeline_gke,
     run_job_config,
     active_context,
     docker_runtime_config,
+    mock_api_instance,
+    dynamic_client,
     deployment_config,
-    deployment_resp,
-    deployment_response_list,
-    deployment_response_list_not_exist,
     deployment_exists,
     update_flag,
     mismatched_image,
@@ -536,6 +498,11 @@ def test_apply_deployment(
     caplog_counter = 0
     test_image_base = "test-image"
     run_job_config = run_job_config._replace(update=update_flag)
+    if not deployment_exists:
+        mock_instance_response = mocker.Mock()
+        mock_instance_response.items = []
+        mock_api_instance.get.return_value = mock_instance_response
+    dynamic_client.resources.get.return_value = mock_api_instance
     if mismatched_image:
         monkeypatch.setattr(
             run_pipeline_gke.klio_config.pipeline_options,
@@ -543,38 +510,25 @@ def test_apply_deployment(
             test_image_base,
         )
     monkeypatch.setattr(run_pipeline_gke, "run_job_config", run_job_config)
-    mock_k8s_client = mocker.Mock()
-    mock_k8s_client.create_namespaced_deployment.return_value = deployment_resp
-    mock_k8s_client.patch_namespaced_deployment.return_value = deployment_resp
-    mock_k8s_client.list_namespaced_deployment.return_value = (
-        deployment_response_list
-        if deployment_exists
-        else deployment_response_list_not_exist
-    )
-    monkeypatch.setattr(
-        run_pipeline_gke, "_kubernetes_client", mock_k8s_client
-    )
+    dynamic_client.resources.get.return_value = mock_api_instance
     monkeypatch.setattr(
         run_pipeline_gke, "_kubernetes_active_context", active_context
     )
-    monkeypatch.setattr(
-        run_pipeline_gke, "_deployment_config", deployment_config
-    )
-    deployment_name = glom.glom(deployment_config, "metadata.name")
+    monkeypatch.setattr(run_pipeline_gke, "_dynamic_client", dynamic_client)
+    kind = glom.glom(deployment_config, "kind")
+    resource_name = glom.glom(deployment_config, "metadata.name")
     namespace = glom.glom(deployment_config, "metadata.namespace")
     image_path = "spec.template.spec.containers.0.image"
     image_base = glom.glom(deployment_config, image_path)
     k8s_image = f"{image_base}:{docker_runtime_config.image_tag}"
-    run_pipeline_gke._apply_image_to_deployment_config()
-    run_pipeline_gke._apply_deployment()
-    assert (
-        glom.glom(run_pipeline_gke._deployment_config, image_path) == k8s_image
-    )
+    run_pipeline_gke._create_resource(deployment_config)
+    run_pipeline_gke._apply_image_to_deployment_config(deployment_config)
+    assert glom.glom(deployment_config, image_path) == k8s_image
     glom.assign(deployment_config, image_path, k8s_image)
     if deployment_exists:
         if update_flag:
-            mock_k8s_client.patch_namespaced_deployment.assert_called_once_with(
-                name=deployment_name,
+            mock_api_instance.patch.assert_called_once_with(
+                name=resource_name,
                 namespace=namespace,
                 body=deployment_config,
             )
@@ -582,15 +536,15 @@ def test_apply_deployment(
         else:
             caplog_counter += 1
     else:
-        mock_k8s_client.create_namespaced_deployment.assert_called_once_with(
+        mock_api_instance.create.assert_called_once_with(
             body=deployment_config, namespace=namespace
         )
         caplog_counter += 1
 
     if deployment_exists and not update_flag:
         assert caplog.records[-1].msg == (
-            f"Cannot apply deployment for {deployment_name}. "
-            "To update an existing deployment, run "
+            f"Cannot apply {kind} for {resource_name}. "
+            "To update an existing resource, run "
             "`klio job run --update`, or set `pipeline_options.update`"
             " to `True` in the job's`klio-job.yaml` file. "
             "Run `klio job stop` to scale a deployment down to 0. "
@@ -600,7 +554,7 @@ def test_apply_deployment(
     if mismatched_image:
         caplog_counter += 1
         built_image = f"{test_image_base}:{docker_runtime_config.image_tag}"
-        assert caplog.records[0].msg == (
+        assert caplog.records[-1].msg == (
             f"Image deployed by kubernetes {k8s_image} does not match "
             f"the built image {built_image}. "
             "This may result in an `ImagePullBackoff` for the deployment. "
@@ -615,31 +569,22 @@ def test_apply_deployment(
 def test_delete(
     monkeypatch,
     mocker,
-    deployment_response_list,
     deployment_config,
+    dynamic_client,
+    mock_api_instance,
     active_context,
 ):
     namespace = glom.glom(deployment_config, "metadata.namespace")
     deployment_name = glom.glom(deployment_config, "metadata.name")
-    mock_k8s_client = mocker.Mock()
-    mock_k8s_client.patch_namespaced_deployment.return_value = deployment_resp
-    mock_k8s_client.list_namespaced_deployment.return_value = (
-        deployment_response_list
-    )
 
     delete_pipeline_gke = job_gke.DeletePipelineGKE("/some/job/dir")
-
-    monkeypatch.setattr(
-        delete_pipeline_gke, "_kubernetes_client", mock_k8s_client
-    )
+    dynamic_client.resources.get.return_value = mock_api_instance
     monkeypatch.setattr(
         delete_pipeline_gke, "_kubernetes_active_context", active_context
     )
-    monkeypatch.setattr(
-        delete_pipeline_gke, "_deployment_config", deployment_config
-    )
-    delete_pipeline_gke.delete()
-    mock_k8s_client.delete_namespaced_deployment.assert_called_once_with(
+    monkeypatch.setattr(delete_pipeline_gke, "_dynamic_client", dynamic_client)
+    delete_pipeline_gke._delete_resource(deployment_config)
+    mock_api_instance.delete.assert_called_once_with(
         name=deployment_name,
         namespace=namespace,
         body=k8s_client.V1DeleteOptions(
@@ -648,26 +593,35 @@ def test_delete(
     )
 
 
+@pytest.mark.parametrize(
+    "is_exists", (True, False),
+)
 def test_stop(
-    deployment_resp, deployment_config, active_context, monkeypatch, mocker
+    is_exists,
+    deployment_config,
+    mock_api_instance,
+    dynamic_client,
+    active_context,
+    monkeypatch,
+    mocker,
 ):
+
     deployment_name = glom.glom(deployment_config, "metadata.name")
     namespace = glom.glom(deployment_config, "metadata.namespace")
-    mock_k8s_client = mocker.Mock()
-    mock_k8s_client.patch_namespaced_deployment.return_value = deployment_resp
-
+    if not is_exists:
+        mock_instance_response = mocker.Mock()
+        mock_instance_response.items = []
+        mock_api_instance.get.return_value = mock_instance_response
+    dynamic_client.resources.get.return_value = mock_api_instance
     stop_pipeline_gke = job_gke.StopPipelineGKE("/some/job/dir")
 
-    monkeypatch.setattr(
-        stop_pipeline_gke, "_kubernetes_client", mock_k8s_client
-    )
+    monkeypatch.setattr(stop_pipeline_gke, "_dynamic_client", dynamic_client)
     monkeypatch.setattr(
         stop_pipeline_gke, "_kubernetes_active_context", active_context
     )
-    monkeypatch.setattr(
-        stop_pipeline_gke, "_deployment_config", deployment_config
-    )
-    stop_pipeline_gke.stop()
-    mock_k8s_client.patch_namespaced_deployment.assert_called_once_with(
-        name=deployment_name, namespace=namespace, body=deployment_config,
+    # Stop functions
+    stop_pipeline_gke._edit_deployment(deployment_config, replica_count=0)
+    stop_pipeline_gke._update_resource(deployment_config)
+    mock_api_instance.patch.assert_called_once_with(
+        name=deployment_name, namespace=namespace, body=deployment_config
     )

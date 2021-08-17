@@ -19,10 +19,10 @@ import os
 import re
 
 import glom
-import ruamel.yaml
 import yaml
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
+from openshift.dynamic import DynamicClient
 
 from klio_cli import __version__ as klio_cli_version
 from klio_cli.commands import base
@@ -49,22 +49,14 @@ class GKECommandMixin(object):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._deployment_config = None
-        self._kubernetes_client = None
+        # TODO: This grabs configs from '~/.kube/config'. @shireenk
+        #  We should add a check that this file exists
+        # If it does not exist then we should create configurations.
+        # See link:
+        # https://github.com/kubernetes-client/python-base/blob/master/config/kube_config.py#L825
+        k8s_config.load_kube_config()
+        self._dynamic_client = None
         self._kubernetes_active_context = None
-
-    @property
-    def kubernetes_client(self):
-        if not self._kubernetes_client:
-            # TODO: This grabs configs from '~/.kube/config'. @shireenk
-            #  We should add a check that this file exists
-            # If it does not exist then we should create configurations.
-            # See link:
-            # https://github.com/kubernetes-client/python-base/blob/master/config/kube_config.py#L825
-            k8s_config.load_kube_config()
-            self._kubernetes_client = k8s_client.AppsV1Api()
-
-        return self._kubernetes_client
 
     @property
     def kubernetes_active_context(self):
@@ -75,43 +67,60 @@ class GKECommandMixin(object):
         return self._kubernetes_active_context
 
     @property
-    def deployment_config(self):
-        if not self._deployment_config:
-            all_yaml = glob.glob(os.path.join(
-                self.job_dir, "kubernetes", "*.yaml"
-            ))
-            for f in all_yaml:
-                path_to_deployment_config = os.path.join(
-                    self.job_dir, "kubernetes", f
-                )
-                with open(path_to_deployment_config) as f:
-                    data =
-            self._deployment_config = yaml.safe_load(f)
-        return self._deployment_config
+    def dynamic_client(self):
+        if not self._dynamic_client:
+            with k8s_client.ApiClient() as api_client:
+                dyn_client = DynamicClient(api_client)
+                self._dynamic_client = dyn_client
+        return self._dynamic_client
 
-    def _deployment_exists(self):
+    def get_deployment_config(self):
+        """Searches kubernetes directory for a Deployment
+            configuration type.
+
+        Returns:
+            dict: deployment_config loaded from a yaml file
+        """
+        k8s_yamls = glob.glob("kubernetes/*.yaml")
+        # Find the deployment
+        for resource_file in k8s_yamls:
+            with open(os.path.join(resource_file)) as d:
+                yaml_config = yaml.safe_load(d)
+                if yaml_config["kind"] == "Deployment":
+                    return yaml_config
+
+    def _resource_exists(self, resource_config):
         """Check to see if a deployment already exists
-
+        Args:
+            resource_config (dict): Kubernetes resource config
+                read in from yaml file.
         Returns:
             bool: Whether a deployment for the given name-namespace
                 combination exists
         """
-        dep = self.deployment_config
-        namespace = glom.glom(dep, "metadata.namespace")
-        deployment_name = glom.glom(dep, "metadata.name")
-        resp = self.kubernetes_client.list_namespaced_deployment(
-            namespace=namespace,
+        api_version = glom.glom(resource_config, "apiVersion")
+        kind = glom.glom(resource_config, "kind")
+        name = glom.glom(resource_config, "metadata.name")
+        namespace = glom.glom(resource_config, "metadata.namespace")
+        api_instance = self.dynamic_client.resources.get(
+            api_version=api_version, kind=kind
         )
+        resp = api_instance.get(body=resource_config, namespace=namespace)
         for i in resp.items:
-            if i.metadata.name == deployment_name:
+            if i.metadata.name == name:
                 return True
         return False
 
-    def _update_deployment(self, replica_count=None, image_tag=None):
+    def _edit_deployment(
+        self, deployment_config, replica_count=None, image_tag=None
+    ):
         """This will update a deployment with a provided
-            replica count or image tag
+            replica count or image tag. This mutates the
+            deployment_config object
 
         Args:
+            deployment_config(dict): deployment configuration dict
+                that will get mutated with updated fields
             replica_count (int): Number of replicas the
                 deployment will be updated with.
                 If not provided then this will not be changed
@@ -119,32 +128,37 @@ class GKECommandMixin(object):
                 to the updated deployment.
                 If not provided then this will not be updated.
         """
-        deployment_name = glom.glom(self.deployment_config, "metadata.name")
-        namespace = glom.glom(self.deployment_config, "metadata.namespace")
         log_messages = []
         if replica_count is not None:
-            glom.assign(
-                self._deployment_config, "spec.replicas", replica_count
-            )
+            glom.assign(deployment_config, "spec.replicas", replica_count)
             log_messages.append(f"Scaled deployment to {replica_count}")
         if image_tag:
             image_path = "spec.template.spec.containers.0.image"
-            image_base = glom.glom(self._deployment_config, image_path)
+            image_base = glom.glom(deployment_config, image_path)
             # Strip off existing image tag if present
             image_base = re.split(":", image_base)[0]
             full_image = image_base + f":{image_tag}"
-            glom.assign(self._deployment_config, image_path, full_image)
+            glom.assign(deployment_config, image_path, full_image)
             log_messages.append(
                 f"Update deployment with image tag {image_tag}"
             )
-        resp = self.kubernetes_client.patch_namespaced_deployment(
-            name=deployment_name,
-            namespace=namespace,
-            body=self.deployment_config,
-        )
-        log_messages.append(f"Update deployment with {resp.metadata.name}")
         for message in log_messages:
             logging.info(message)
+
+    def _update_resource(self, resource_config):
+        api_version = resource_config["apiVersion"]
+        kind = resource_config["kind"]
+        resource_name = glom.glom(resource_config, "metadata.name")
+        namespace = glom.glom(resource_config, "metadata.namespace")
+
+        api_instance = self.dynamic_client.resources.get(
+            api_version=api_version, kind=kind
+        )
+
+        api_instance.patch(
+            name=resource_name, namespace=namespace, body=resource_config,
+        )
+        logging.info(f"Updated {kind} {resource_name}")
 
 
 class RunPipelineGKE(GKECommandMixin, base.BaseDockerizedPipeline):
@@ -154,22 +168,38 @@ class RunPipelineGKE(GKECommandMixin, base.BaseDockerizedPipeline):
         super().__init__(job_dir, klio_config, docker_runtime_config)
         self.run_job_config = run_job_config
 
-    def _apply_image_to_deployment_config(self):
+    def _apply_all_resources(self):
+        k8s_yamls = glob.glob("kubernetes/*.yaml")
+        if not len(k8s_yamls) > 0:
+            logging.warning(
+                "No '*.yaml' files located in the kubernetes directory. "
+                "No resources will be created."
+            )
+            return
+
+        for resource_file in k8s_yamls:
+            with open(os.path.join(resource_file)) as d:
+                resource_config = yaml.safe_load(d)
+            if resource_config["kind"] == "Deployment":
+                self._apply_labels_to_deployment_config(resource_config)
+                self._apply_image_to_deployment_config(resource_config)
+            self._create_resource(resource_config)
+
+    def _apply_image_to_deployment_config(self, deployment_config):
         image_tag = self.docker_runtime_config.image_tag
         pipeline_options = self.klio_config.pipeline_options
         if image_tag:
-            dep = self.deployment_config
             image_path = "spec.template.spec.containers.0.image"
             # TODO: If more than one image deployed,
             #  we need to search for correct container
-            image_base = glom.glom(dep, image_path)
+            image_base = glom.glom(deployment_config, image_path)
             # Strip off existing image tag if any
             image_base = re.split(":", image_base)[0]
             full_image = f"{image_base}:{image_tag}"
-            glom.assign(self._deployment_config, image_path, full_image)
+            glom.assign(deployment_config, image_path, full_image)
         # Check to see if the kubernetes image to be deployed is the same
         # image that is built
-        k8s_image = glom.glom(self.deployment_config, image_path)
+        k8s_image = glom.glom(deployment_config, image_path)
         built_image_base = pipeline_options.worker_harness_container_image
         built_image = f"{built_image_base}:{image_tag}"
         if built_image != k8s_image:
@@ -240,7 +270,7 @@ class RunPipelineGKE(GKECommandMixin, base.BaseDockerizedPipeline):
                     f"See {help_url} for valid values."
                 )
 
-    def _apply_labels_to_deployment_config(self):
+    def _apply_labels_to_deployment_config(self, deployment_config):
         # `metadata.labels` are a best practices thing, but not required
         # (these would be "deployment labels"). At least one label defined in
         # `spec.template.metadata.labels` is required for k8s deployments
@@ -253,7 +283,7 @@ class RunPipelineGKE(GKECommandMixin, base.BaseDockerizedPipeline):
 
         # standard practice labels ("app" and "role")
         existing_metadata_labels = glom.glom(
-            self.deployment_config, "metadata.labels", default={}
+            deployment_config, "metadata.labels", default={}
         )
         metadata_app = glom.glom(existing_metadata_labels, "app", default=None)
         if not metadata_app:
@@ -262,7 +292,7 @@ class RunPipelineGKE(GKECommandMixin, base.BaseDockerizedPipeline):
         metadata_labels.update(existing_metadata_labels)
 
         existing_pod_labels = glom.glom(
-            self.deployment_config, "spec.template.metadata.labels", default={}
+            deployment_config, "spec.template.metadata.labels", default={}
         )
         pod_app = glom.glom(existing_pod_labels, "app", default=None)
         pod_role = glom.glom(existing_pod_labels, "role", default=None)
@@ -276,7 +306,7 @@ class RunPipelineGKE(GKECommandMixin, base.BaseDockerizedPipeline):
         pod_labels.update(existing_pod_labels)
 
         existing_selector_labels = glom.glom(
-            self.deployment_config, "spec.selector.matchLabels", default={}
+            deployment_config, "spec.selector.matchLabels", default={}
         )
         selector_app = glom.glom(existing_selector_labels, "app", default=None)
         selector_role = glom.glom(
@@ -327,40 +357,46 @@ class RunPipelineGKE(GKECommandMixin, base.BaseDockerizedPipeline):
             # raises if not valid
             RunPipelineGKE._validate_labels(label_path, label_dict)
             glom.assign(
-                self.deployment_config, label_path, label_dict, missing=dict
+                deployment_config, label_path, label_dict, missing=dict
             )
 
-    def _apply_deployment(self):
-        """Create a namespaced deploy if the deployment does not already exist.
-        If the namespaced deployment already exists then
+    def _create_resource(self, resource_config):
+        """Create a namespaced resource if the resource does not already exist.
+        If the namespaced resource already exists then
         `self.run_job_config.update` will determine if the
-        deployment will be updated or not.
+        resource will be updated or not.
         """
-        dep = self.deployment_config
-        namespace = glom.glom(dep, "metadata.namespace")
-        deployment_name = glom.glom(dep, "metadata.name")
-        if not self._deployment_exists():
-            resp = self.kubernetes_client.create_namespaced_deployment(
-                body=dep, namespace=namespace
-            )
-            deployment_name = resp.metadata.name
-            current_cluster = self.kubernetes_active_context["name"]
-            logging.info(
-                f"Deployment created for {deployment_name} "
-                f"in cluster {current_cluster}"
-            )
-        else:
+        api_version = resource_config["apiVersion"]
+        kind = resource_config["kind"]
+        resource_name = glom.glom(resource_config, "metadata.name")
+        namespace = glom.glom(resource_config, "metadata.namespace")
+
+        if self._resource_exists(resource_config):
             if self.run_job_config.update:
-                self._update_deployment()
+                self._update_resource(resource_config)
             else:
                 logging.warning(
-                    f"Cannot apply deployment for {deployment_name}. "
-                    "To update an existing deployment, run "
+                    f"Cannot apply {kind} for {resource_name}. "
+                    "To update an existing resource, run "
                     "`klio job run --update`, or set `pipeline_options.update`"
                     " to `True` in the job's`klio-job.yaml` file. "
                     "Run `klio job stop` to scale a deployment down to 0. "
                     "Run `klio job delete` to delete a deployment entirely."
                 )
+                return
+        else:
+            api_instance = self.dynamic_client.resources.get(
+                api_version=api_version, kind=kind
+            )
+
+            api_instance.create(
+                namespace=namespace, body=resource_config,
+            )
+            current_cluster = self.kubernetes_active_context["name"]
+            logging.info(
+                f"Created {kind} {resource_name} "
+                f"in cluster {current_cluster}."
+            )
 
     def _setup_docker_image(self):
         super()._setup_docker_image()
@@ -381,10 +417,7 @@ class RunPipelineGKE(GKECommandMixin, base.BaseDockerizedPipeline):
         self._check_docker_setup()
         self._setup_docker_image()
 
-        self._apply_image_to_deployment_config()
-        self._apply_labels_to_deployment_config()
-
-        self._apply_deployment(**kwargs)
+        self._apply_all_resources(**kwargs)
 
 
 class StopPipelineGKE(GKECommandMixin):
@@ -393,10 +426,12 @@ class StopPipelineGKE(GKECommandMixin):
         self.job_dir = job_dir
 
     def stop(self):
-        """Delete a namespaced deployment
+        """Scale a namespaced deployment down to 0 replicas
         Expects existence of a kubernetes/deployment.yaml
         """
-        self._update_deployment(replica_count=0)
+        deployment = self.get_deployment_config()
+        self._edit_deployment(deployment, replica_count=0)
+        self._update_resource(deployment)
 
 
 class DeletePipelineGKE(GKECommandMixin):
@@ -404,29 +439,39 @@ class DeletePipelineGKE(GKECommandMixin):
         super().__init__()
         self.job_dir = job_dir
 
-    def _delete_deployment(self):
-        dep = self.deployment_config
-        deployment_name = glom.glom(dep, "metadata.name")
-        namespace = glom.glom(dep, "metadata.namespace")
-        # Some messaging might change if we multi-cluster deployments
-        current_cluster = self.kubernetes_active_context["name"]
-        if self._deployment_exists():
-            resp = self.kubernetes_client.delete_namespaced_deployment(
-                name=deployment_name,
+    def _delete_all_resources(self):
+        k8s_yamls = glob.glob("kubernetes/*.yaml")
+        for resource_file in k8s_yamls:
+            with open(os.path.join(resource_file)) as d:
+                yaml_config = yaml.safe_load(d)
+            self._delete_resource(yaml_config)
+
+    def _delete_resource(self, resource_config):
+        api_version = resource_config["apiVersion"]
+        kind = resource_config["kind"]
+        resource_name = glom.glom(resource_config, "metadata.name")
+        namespace = glom.glom(resource_config, "metadata.namespace")
+
+        if self._resource_exists(resource_config):
+            api_instance = self.dynamic_client.resources.get(
+                api_version=api_version, kind=kind
+            )
+            api_instance.delete(
+                name=resource_name,
                 namespace=namespace,
                 body=k8s_client.V1DeleteOptions(
                     propagation_policy="Foreground", grace_period_seconds=5
                 ),
             )
-            logging.info(f"Deployment deleted: {resp}.")
-        else:
-            logging.error(
-                f"Deployment {namespace}:{deployment_name} "
-                f"does not exist in cluster {current_cluster}."
+            current_cluster = self.kubernetes_active_context["name"]
+            logging.info(
+                f"Deleted {kind} {resource_name} "
+                f"in cluster {current_cluster}."
             )
+        else:
+            logging.warning(f"{kind} {resource_name} does not exists.")
 
     def delete(self):
-        """Delete a namespaced deployment
-        Expects existence of a kubernetes/deployment.yaml
+        """Delete a namespaced resource
         """
-        self._delete_deployment()
+        self._delete_all_resources()
